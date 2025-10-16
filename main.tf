@@ -133,26 +133,26 @@ resource "aws_instance" "k8s_master" {
 
     # kube packages
     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
--    echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
--    apt-get update -y
--    apt-get install -y kubelet kubeadm kubectl
--    apt-mark hold kubelet kubeadm kubectl
-+    # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
-+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-+    if [ -s /tmp/k8s-key.gpg ]; then
-+      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-+      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-+      apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
-+      apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
-+      apt-mark hold kubelet kubeadm kubectl || true
-+    else
-+      echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
-+      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-+      if [ -n "$${KUBEV}" ]; then
-+        curl -fsSL "https://dl.k8s.io/release/${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
-+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
-+      fi
-+    fi
+     echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+     apt-get update -y
+     apt-get install -y kubelet kubeadm kubectl
+     apt-mark hold kubelet kubeadm kubectl
+     # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
+     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
+     if [ -s /tmp/k8s-key.gpg ]; then
+       install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
+       echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+       apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
+       apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
+       apt-mark hold kubelet kubeadm kubectl || true
+     else
+       echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
+       KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
+       if [ -n "$${KUBEV}" ]; then
+         curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
+      fi
+     fi
 
     # kubeadm init (single control-plane)
     kubeadm init --pod-network-cidr=10.244.0.0/16 | tee /root/kubeadm-init.out
@@ -219,26 +219,26 @@ resource "aws_instance" "k8s_worker" {
 
     # kube packages
     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
--    echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
--    apt-get update -y
--    apt-get install -y kubelet kubeadm kubectl
--    apt-mark hold kubelet kubeadm kubectl
-+    # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
-+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-+    if [ -s /tmp/k8s-key.gpg ]; then
-+      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-+      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-+      apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
-+      apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
-+      apt-mark hold kubelet kubeadm kubectl || true
-+    else
-+      echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
-+      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-+      if [ -n "$${KUBEV}" ]; then
-+        curl -fsSL "https://dl.k8s.io/release/${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
-+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
-+      fi
-+    fi
+     echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+     apt-get update -y
+     apt-get install -y kubelet kubeadm kubectl
+     apt-mark hold kubelet kubeadm kubectl
+     # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
+     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
+     if [ -s /tmp/k8s-key.gpg ]; then
+       install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
+       echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+       apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
+       apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
+       apt-mark hold kubelet kubeadm kubectl || true
+     else
+       echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
+       KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
+       if [ -n "$${KUBEV}" ]; then
+         curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
+         install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
+       fi
+     fi
 
     # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
     JOIN_FILE="/root/join_cmd.sh"
