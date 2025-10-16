@@ -79,34 +79,84 @@ resource "aws_instance" "argo_server" {
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
+    retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
+
     apt-get update -y
-    apt-get install -y docker.io awscli jq
-    systemctl enable --now docker
+    retry apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli || true
+    systemctl enable --now docker || true
 
-    KUBEDIR="/home/ubuntu/.kube"
-    mkdir -p $${KUBEDIR}
-    # fetch argocd serviceaccount kubeconfig from S3 (requires argo role with GetObject)
-    aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/argocd-kubeconfig $${KUBEDIR}/config
-    chown -R ubuntu:ubuntu $${KUBEDIR}
-    chmod 600 $${KUBEDIR}/config || true
-    export KUBECONFIG=$${KUBEDIR}/config
+    # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
+    if [ -s /tmp/k8s-key.gpg ]; then
+      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
+      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+      apt-get update -y || true
+      retry apt-get install -y kubelet kubeadm kubectl || true
+      apt-mark hold kubelet kubeadm kubectl || true
+    else
+      echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
+      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
+      if [ -n "$${KUBEV}" ]; then
+        curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
+      fi
+    fi
 
-    # run ArgoCD components as containers (simple/dev setup)
-    docker pull argoproj/argocd:v2.9.7
+    # kubeadm init (single control-plane) with retry
+    retry kubeadm init --pod-network-cidr=10.244.0.0/16 | tee /root/kubeadm-init.out || true
 
-    docker run -d --name argocd-repo-server argoproj/argocd:v2.9.7 argocd-repo-server
+    # setup kubeconfig for ubuntu user if admin.conf exists
+    if [ -f /etc/kubernetes/admin.conf ]; then
+      mkdir -p /home/ubuntu/.kube
+      cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+      chown -R ubuntu:ubuntu /home/ubuntu/.kube
+      chmod 600 /home/ubuntu/.kube/config
+    fi
 
-    docker run -d --name argocd-application-controller \
-      -v $${KUBEDIR}/config:/root/.kube/config:ro \
-      argoproj/argocd:v2.9.7 argocd-application-controller
+    # install Flannel CNI (or your CNI)
+    su - ubuntu -c "kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml" || true
 
-    docker run -d --name argocd-server \
-      -p 8080:8080 -p 443:443 \
-      -v $${KUBEDIR}/config:/root/.kube/config:ro \
-      argoproj/argocd:v2.9.7 argocd-server
+    # wait best-effort
+    su - ubuntu -c "kubectl wait --for=condition=Ready nodes --all --timeout=300s" || true
 
-    # NOTE: initial admin password is stored inside a Kubernetes secret (admin in cluster),
-    # for container-mode you may need to extract secret via kubectl using the admin kubeconfig.
+    # create serviceaccount for ArgoCD and bind (narrow permissions in prod)
+    su - ubuntu -c "kubectl create serviceaccount argocd-manager -n kube-system || true"
+    su - ubuntu -c "kubectl create clusterrolebinding argocd-manager-binding --clusterrole=cluster-admin --serviceaccount=kube-system:argocd-manager || true"
+
+    # build kubeconfig for the SA
+    SA_SECRET=$$(su - ubuntu -c "kubectl -n kube-system get sa argocd-manager -o jsonpath='{.secrets[0].name}'" || echo "")
+    if [ -n "$${SA_SECRET}" ]; then
+      SA_TOKEN=$$(su - ubuntu -c "kubectl -n kube-system get secret $${SA_SECRET} -o jsonpath='{.data.token}' | base64 -d" || echo "")
+      APISERVER=$$(su - ubuntu -c "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'" || echo "")
+      KUBECONFIG_OUT="/home/ubuntu/argocd-kubeconfig"
+      su - ubuntu -c "kubectl config set-cluster argocd-cluster --server=$${APISERVER} --certificate-authority=/etc/kubernetes/pki/ca.crt --embed-certs=true --kubeconfig=$${KUBECONFIG_OUT}" || true
+      su - ubuntu -c "kubectl config set-credentials argocd-manager --token='$${SA_TOKEN}' --kubeconfig=$${KUBECONFIG_OUT}" || true
+      su - ubuntu -c "kubectl config set-context argocd-context --cluster=argocd-cluster --user=argocd-manager --kubeconfig=$${KUBECONFIG_OUT}" || true
+      su - ubuntu -c "kubectl config use-context argocd-context --kubeconfig=$${KUBECONFIG_OUT}" || true
+      chown ubuntu:ubuntu $${KUBECONFIG_OUT} || true
+      chmod 600 $${KUBECONFIG_OUT} || true
+
+      # upload kubeconfigs to S3 (master role must have PutObject) with retries
+      for i in 1 2 3 4; do
+        aws s3 cp /home/ubuntu/.kube/config s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/admin.conf --no-progress && break || sleep 5
+      done
+      for i in 1 2 3 4; do
+        aws s3 cp /home/ubuntu/argocd-kubeconfig s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/argocd-kubeconfig --no-progress && break || sleep 5
+      done
+    fi
+
+    # save join command (for workers) if present and upload
+    if [ -f /root/kubeadm-init.out ]; then
+      grep "kubeadm join" -A 2 /root/kubeadm-init.out > /root/join_cmd.sh || true
+      chmod +x /root/join_cmd.sh || true
+      for i in 1 2 3; do
+        aws s3 cp /root/join_cmd.sh s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh --no-progress && break || sleep 5
+      done
+    fi
+
+    # collect logs
+    journalctl -u kubelet --no-pager -n 200 > /var/log/kubelet-start.log || true
+    journalctl -u docker --no-pager -n 200 > /var/log/docker-start.log || true
   EOF
 
   tags = {
@@ -127,72 +177,45 @@ resource "aws_instance" "k8s_master" {
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
-    apt-get update -y
-    apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli
-    systemctl enable --now docker
+    retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
 
-    # kube packages
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-     echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-     apt-get update -y
-     apt-get install -y kubelet kubeadm kubectl
-     apt-mark hold kubelet kubeadm kubectl
-     # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
-     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-     if [ -s /tmp/k8s-key.gpg ]; then
-       install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-       echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-       apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
-       apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
-       apt-mark hold kubelet kubeadm kubectl || true
-     else
-       echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
-       KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-       if [ -n "$${KUBEV}" ]; then
-         curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
+    apt-get update -y
+    retry apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli || true
+    systemctl enable --now docker || true
+
+    # robust K8s apt install like master
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
+    if [ -s /tmp/k8s-key.gpg ]; then
+      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
+      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+      apt-get update -y || true
+      retry apt-get install -y kubelet kubeadm kubectl || true
+      apt-mark hold kubelet kubeadm kubectl || true
+    else
+      echo "Failed to fetch K8s apt key; attempting kubectl only fallback" >&2
+      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
+      if [ -n "$${KUBEV}" ]; then
+        curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
         install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
       fi
-     fi
+    fi
 
-    # kubeadm init (single control-plane)
-    kubeadm init --pod-network-cidr=10.244.0.0/16 | tee /root/kubeadm-init.out
+    # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
+    JOIN_FILE="/root/join_cmd.sh"
+    for i in $(seq 1 30); do
+      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE} --no-progress; then
+        chmod +x $${JOIN_FILE}
+        bash $${JOIN_FILE} && break
+      fi
+      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
+      sleep 10
+    done
 
-    # setup kubeconfig for ubuntu user
-    mkdir -p /home/ubuntu/.kube
-    cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-    chown -R ubuntu:ubuntu /home/ubuntu/.kube
-    chmod 600 /home/ubuntu/.kube/config
-
-    # install Flannel CNI (or choose your CNI)
-    su - ubuntu -c "kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml"
-
-    # wait (best-effort)
-    su - ubuntu -c "kubectl wait --for=condition=Ready nodes --all --timeout=300s" || true
-
-    # create serviceaccount for ArgoCD and bind (example uses cluster-admin -> narrow in production)
-    su - ubuntu -c "kubectl create serviceaccount argocd-manager -n kube-system || true"
-    su - ubuntu -c "kubectl create clusterrolebinding argocd-manager-binding --clusterrole=cluster-admin --serviceaccount=kube-system:argocd-manager || true"
-
-    # build kubeconfig for the SA
-    SA_SECRET=$$(su - ubuntu -c "kubectl -n kube-system get sa argocd-manager -o jsonpath='{.secrets[0].name}'")
-    SA_TOKEN=$$(su - ubuntu -c "kubectl -n kube-system get secret $${SA_SECRET} -o jsonpath='{.data.token}' | base64 -d")
-    APISERVER=$$(su - ubuntu -c "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'")
-
-    KUBECONFIG_OUT="/home/ubuntu/argocd-kubeconfig"
-    su - ubuntu -c "kubectl config set-cluster argocd-cluster --server=$${APISERVER} --certificate-authority=/etc/kubernetes/pki/ca.crt --embed-certs=true --kubeconfig=$${KUBECONFIG_OUT}"
-    su - ubuntu -c "kubectl config set-credentials argocd-manager --token='$${SA_TOKEN}' --kubeconfig=$${KUBECONFIG_OUT}"
-    su - ubuntu -c "kubectl config set-context argocd-context --cluster=argocd-cluster --user=argocd-manager --kubeconfig=$${KUBECONFIG_OUT}"
-    su - ubuntu -c "kubectl config use-context argocd-context --kubeconfig=$${KUBECONFIG_OUT}"
-    chown ubuntu:ubuntu $${KUBECONFIG_OUT}
-    chmod 600 $${KUBECONFIG_OUT}
-
-    # upload kubeconfigs to S3 (master role must have PutObject)
-    aws s3 cp /home/ubuntu/.kube/config s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/admin.conf --acl private
-    aws s3 cp /home/ubuntu/argocd-kubeconfig s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/argocd-kubeconfig --acl private
-
-    # save join command (for workers)
-    grep "kubeadm join" -A 2 /root/kubeadm-init.out > /root/join_cmd.sh || true
-    chmod +x /root/join_cmd.sh || true
+    # If join failed, write log for debugging
+    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
+      echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
+      journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
+    fi
   EOF
 
   tags = {
@@ -214,48 +237,33 @@ resource "aws_instance" "k8s_worker" {
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update -y
-    apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli
+    apt-get install -y docker.io curl
     systemctl enable --now docker
 
-    # kube packages
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-     echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-     apt-get update -y
-     apt-get install -y kubelet kubeadm kubectl
-     apt-mark hold kubelet kubeadm kubectl
-     # robust K8s apt install: keyring + signed-by, with fallback to kubectl binary
-     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-     if [ -s /tmp/k8s-key.gpg ]; then
-       install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-       echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-       apt-get update -y || echo "apt-get update failed for kubernetes repo" >&2
-       apt-get install -y kubelet kubeadm kubectl || echo "apt install kube* failed" >&2
-       apt-mark hold kubelet kubeadm kubectl || true
-     else
-       echo "Failed to download K8s apt key; attempting kubectl fallback" >&2
-       KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-       if [ -n "$${KUBEV}" ]; then
-         curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
-         install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
-       fi
-     fi
+    mkdir -p /opt/prometheus
 
-    # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
-    JOIN_FILE="/root/join_cmd.sh"
-    for i in $(seq 1 30); do
-      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE}; then
-        chmod +x $${JOIN_FILE}
-        bash $${JOIN_FILE} && break
-      fi
-      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
-      sleep 10
-    done
+    cat > /opt/prometheus/prometheus.yml <<'PROMYAML'
+    global:
+      scrape_interval: 15s
 
-    # If join failed, write log for debugging
-    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
-      echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
-      journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
-    fi
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: 'k8s-nodes'
+        static_configs:
+          - targets: ['${aws_eip.k8s_master_eip.public_ip}:9100','${aws_eip.k8s_worker_eip.public_ip}:9100']
+    PROMYAML
+
+    docker run -d --name prometheus --restart unless-stopped \
+      -p 9090:9090 \
+      -v /opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+      prom/prometheus:latest
+
+    docker run -d --name grafana --restart unless-stopped \
+      -p 3000:3000 \
+      grafana/grafana:latest
   EOF
 
   tags = {
