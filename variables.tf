@@ -38,3 +38,9 @@ variable "kubeconfig_s3_key_prefix" {
   type        = string
   default     = "kubeconfigs"
 }
+
+variable "kubeconfig_s3_bucket" {
+  description = "S3 bucket to store kubeconfigs"
+  type        = string
+  default     = "phj-devops-cd"
+}
