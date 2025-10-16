@@ -236,34 +236,45 @@ resource "aws_instance" "k8s_worker" {
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
+    retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
+
     apt-get update -y
-    apt-get install -y docker.io curl
-    systemctl enable --now docker
+    retry apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli || true
+    systemctl enable --now docker || true
 
-    mkdir -p /opt/prometheus
+    # robust K8s apt install like master
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
+    if [ -s /tmp/k8s-key.gpg ]; then
+      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
+      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+      apt-get update -y || true
+      retry apt-get install -y kubelet kubeadm kubectl || true
+      apt-mark hold kubelet kubeadm kubectl || true
+    else
+      echo "Failed to fetch K8s apt key; attempting kubectl only fallback" >&2
+      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
+      if [ -n "$${KUBEV}" ]; then
+        curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
+      fi
+    fi
 
-    cat > /opt/prometheus/prometheus.yml <<'PROMYAML'
-    global:
-      scrape_interval: 15s
+    # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
+    JOIN_FILE="/root/join_cmd.sh"
+    for i in $(seq 1 30); do
+      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE} --no-progress; then
+        chmod +x $${JOIN_FILE}
+        bash $${JOIN_FILE} && break
+      fi
+      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
+      sleep 10
+    done
 
-    scrape_configs:
-      - job_name: 'prometheus'
-        static_configs:
-          - targets: ['localhost:9090']
-
-      - job_name: 'k8s-nodes'
-        static_configs:
-          - targets: ['${aws_eip.k8s_master_eip.public_ip}:9100','${aws_eip.k8s_worker_eip.public_ip}:9100']
-    PROMYAML
-
-    docker run -d --name prometheus --restart unless-stopped \
-      -p 9090:9090 \
-      -v /opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
-      prom/prometheus:latest
-
-    docker run -d --name grafana --restart unless-stopped \
-      -p 3000:3000 \
-      grafana/grafana:latest
+    # If join failed, write log for debugging
+    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
+      echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
+      journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
+    fi
   EOF
 
   tags = {
