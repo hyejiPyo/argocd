@@ -211,16 +211,16 @@ resource "aws_instance" "k8s_worker" {
     # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
     JOIN_FILE="/root/join_cmd.sh"
     for i in $(seq 1 30); do
-      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh ${JOIN_FILE}; then
-        chmod +x ${JOIN_FILE}
-        bash ${JOIN_FILE} && break
+      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE}; then
+        chmod +x $${JOIN_FILE}
+        bash $${JOIN_FILE} && break
       fi
-      echo "join_cmd.sh not available yet, retrying (${i}/30)..."
+      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
       sleep 10
     done
 
     # If join failed, write log for debugging
-    if ! grep -q "kubeadm join" ${JOIN_FILE} 2>/dev/null; then
+    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
       echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
       journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
     fi
