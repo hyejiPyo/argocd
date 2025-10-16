@@ -238,6 +238,49 @@ resource "aws_instance" "monitor" {
   key_name      = var.aws_key_name
   subnet_id     = var.subnet_id
   vpc_security_group_ids = [aws_security_group.default.id]
+
+  user_data = <<-EOF
+    #!/bin/bash
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    apt-get install -y docker.io curl
+    systemctl enable --now docker
+
+    # create prometheus config dir
+    mkdir -p /opt/prometheus
+
+    # write a minimal Prometheus config (scrapes prometheus itself + kube node exporters)
+    cat > /opt/prometheus/prometheus.yml <<'PROMYAML'
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: 'k8s-nodes'
+        static_configs:
+          - targets: ['${aws_eip.k8s_master_eip.public_ip}:9100','${aws_eip.k8s_worker_eip.public_ip}:9100']
+    PROMYAML
+
+    # run Prometheus container (mount config)
+    docker run -d --name prometheus \
+      -p 9090:9090 \
+      -v /opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+      prom/prometheus:latest
+
+    # run Grafana
+    docker run -d --name grafana \
+      -p 3000:3000 \
+      grafana/grafana:latest
+
+    # enable simple restart on reboot
+    docker update --restart unless-stopped prometheus grafana || true
+  EOF
+
   tags = {
     Name = "prom-grafana"
   }
