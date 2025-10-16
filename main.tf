@@ -2,19 +2,9 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Ubuntu AMI (Canonical)
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-}
-
 resource "aws_security_group" "default" {
-  name        = "jenkind-cd-sg"
-  description = "jenkins-cd-sg"
+  name        = "devops-cd-sg"
+  description = "devops-cd-sg"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -67,14 +57,6 @@ resource "aws_security_group" "default" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Jenkins agent inbound (JNLP)
-  ingress {
-    from_port   = 50000
-    to_port     = 50000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -83,85 +65,143 @@ resource "aws_security_group" "default" {
   }
 }
 
-# jenkins server(CD)
-resource "aws_instance" "jenkins_server" {
+# arogoCD
+resource "aws_instance" "argo_server" {
   ami           = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
   key_name      = var.aws_key_name
   subnet_id     = var.subnet_id
   vpc_security_group_ids = [aws_security_group.default.id]
+  iam_instance_profile  = aws_iam_instance_profile.argo_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-11-jdk curl gnupg2
-    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io.key | apt-key add -
-    sh -c 'echo deb https://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y jenkins
-    systemctl enable --now jenkins
-  EOF
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
 
-  tags = {
-    Name = "jenkins-server"
-  }
-}
-
-# jenkins agent server
-resource "aws_instance" "jenkins_agent" {
-  ami           = data.aws_ami.ubuntu.id
-  instance_type = var.instance_type
-  key_name      = var.aws_key_name
-  subnet_id     = var.subnet_id
-  vpc_security_group_ids = [aws_security_group.default.id]
-
-  user_data = <<-EOF
-    #!/bin/bash
     apt-get update -y
-    apt-get install -y docker.io curl
+    apt-get install -y docker.io awscli jq
     systemctl enable --now docker
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-    rm kubectl
-  EOF
 
+    KUBEDIR="/home/ubuntu/.kube"
+    mkdir -p ${KUBEDIR}
+    # fetch argocd serviceaccount kubeconfig from S3 (requires argo role with GetObject)
+    aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/argocd-kubeconfig ${KUBEDIR}/config
+    chown -R ubuntu:ubuntu ${KUBEDIR}
+    chmod 600 ${KUBEDIR}/config || true
+    export KUBECONFIG=${KUBEDIR}/config
+
+    # run ArgoCD components as containers (simple/dev setup)
+    docker pull argoproj/argocd:v2.9.7
+
+    docker run -d --name argocd-repo-server argoproj/argocd:v2.9.7 argocd-repo-server
+
+    docker run -d --name argocd-application-controller \
+      -v ${KUBEDIR}/config:/root/.kube/config:ro \
+      argoproj/argocd:v2.9.7 argocd-application-controller
+
+    docker run -d --name argocd-server \
+      -p 8080:8080 -p 443:443 \
+      -v ${KUBEDIR}/config:/root/.kube/config:ro \
+      argoproj/argocd:v2.9.7 argocd-server
+
+    # NOTE: initial admin password is stored inside a Kubernetes secret (admin in cluster),
+    # for container-mode you may need to extract secret via kubectl using the admin kubeconfig.
+  EOF
   tags = {
-    Name = "jenkins-agent"
+    Name = "argocd-server"
   }
 }
 
-# prometheus server
-resource "aws_instance" "prometheus" {
+resource "aws_instance" "k8s_master" {
   ami           = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
   key_name      = var.aws_key_name
   subnet_id     = var.subnet_id
   vpc_security_group_ids = [aws_security_group.default.id]
+  iam_instance_profile  = aws_iam_instance_profile.master_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
     apt-get update -y
-    apt-get install -y docker.io
+    apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli
     systemctl enable --now docker
-    # run Prometheus & Grafana containers (simple startup; replace with proper config)
-    docker run -d --name prometheus -p 9090:9090 prom/prometheus
-    docker run -d --name grafana -p 3000:3000 grafana/grafana
+
+    # kube packages
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+    echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -y
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+
+    # kubeadm init (single control-plane)
+    kubeadm init --pod-network-cidr=10.244.0.0/16 | tee /root/kubeadm-init.out
+
+    # setup kubeconfig for ubuntu user
+    mkdir -p /home/ubuntu/.kube
+    cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+    chown -R ubuntu:ubuntu /home/ubuntu/.kube
+    chmod 600 /home/ubuntu/.kube/config
+
+    # install Flannel CNI (or choose your CNI)
+    su - ubuntu -c "kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml"
+
+    # wait (best-effort)
+    su - ubuntu -c "kubectl wait --for=condition=Ready nodes --all --timeout=300s" || true
+
+    # create serviceaccount for ArgoCD and bind (example uses cluster-admin -> narrow in production)
+    su - ubuntu -c "kubectl create serviceaccount argocd-manager -n kube-system || true"
+    su - ubuntu -c "kubectl create clusterrolebinding argocd-manager-binding --clusterrole=cluster-admin --serviceaccount=kube-system:argocd-manager || true"
+
+    # build kubeconfig for the SA
+    SA_SECRET=$(su - ubuntu -c "kubectl -n kube-system get sa argocd-manager -o jsonpath='{.secrets[0].name}'")
+    SA_TOKEN=$(su - ubuntu -c "kubectl -n kube-system get secret ${SA_SECRET} -o jsonpath='{.data.token}' | base64 -d")
+    APISERVER=$(su - ubuntu -c "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'")
+
+    KUBECONFIG_OUT="/home/ubuntu/argocd-kubeconfig"
+    su - ubuntu -c "kubectl config set-cluster argocd-cluster --server=${APISERVER} --certificate-authority=/etc/kubernetes/pki/ca.crt --embed-certs=true --kubeconfig=${KUBECONFIG_OUT}"
+    su - ubuntu -c "kubectl config set-credentials argocd-manager --token='${SA_TOKEN}' --kubeconfig=${KUBECONFIG_OUT}"
+    su - ubuntu -c "kubectl config set-context argocd-context --cluster=argocd-cluster --user=argocd-manager --kubeconfig=${KUBECONFIG_OUT}"
+    su - ubuntu -c "kubectl config use-context argocd-context --kubeconfig=${KUBECONFIG_OUT}"
+    chown ubuntu:ubuntu ${KUBECONFIG_OUT}
+    chmod 600 ${KUBECONFIG_OUT}
+
+    # upload kubeconfigs to S3 (master role must have PutObject)
+    aws s3 cp /home/ubuntu/.kube/config s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/admin.conf --acl private
+    aws s3 cp /home/ubuntu/argocd-kubeconfig s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/argocd-kubeconfig --acl private
+
+    # save join command (for workers)
+    grep "kubeadm join" -A 2 /root/kubeadm-init.out > /root/join_cmd.sh || true
+    chmod +x /root/join_cmd.sh || true
   EOF
 
   tags = {
-    Name = "prometheus-server"
+    Name = "k8s-master"
   }
 }
 
-# Elastic IPs for each server
-resource "aws_eip" "jenkins_server_eip" {
-  instance = aws_instance.jenkins_server.id
+resource "aws_instance" "k8s_worker" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
+  key_name      = var.aws_key_name
+  subnet_id     = var.subnet_id
+  vpc_security_group_ids = [aws_security_group.default.id]
+  tags = {
+    Name = "k8s-worker"
+  }
 }
 
-resource "aws_eip" "jenkins_agent_eip" {
-  instance = aws_instance.jenkins_agent.id
-}
-
-resource "aws_eip" "prometheus_eip" {
-  instance = aws_instance.prometheus.id
+#prometheus + grafana
+resource "aws_instance" "monitor" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
+  key_name      = var.aws_key_name
+  subnet_id     = var.subnet_id
+  vpc_security_group_ids = [aws_security_group.default.id]
+  tags = {
+    Name = "prom-grafana"
+  }
 }

@@ -21,9 +21,20 @@ variable "instance_type" {
   default = "t3.medium"
 }
 
-
+# s3 관련 변수
 variable "subnet_id" {
   description = "AWS Subnet"
   type = string
   default = "subnet-075de9772da50ef19"
+}
+
+variable "kubeconfig_s3_bucket" {
+  description = "S3 bucket to store kubeconfigs"
+  type        = string
+}
+
+variable "kubeconfig_s3_key_prefix" {
+  description = "S3 key prefix (folder) for kubeconfigs"
+  type        = string
+  default     = "kubeconfigs"
 }
