@@ -28,11 +28,6 @@ variable "subnet_id" {
   default = "subnet-075de9772da50ef19"
 }
 
-variable "kubeconfig_s3_bucket" {
-  description = "S3 bucket to store kubeconfigs"
-  type        = string
-}
-
 variable "kubeconfig_s3_key_prefix" {
   description = "S3 key prefix (folder) for kubeconfigs"
   type        = string
