@@ -288,20 +288,16 @@ resource "aws_instance" "monitor" {
 
 resource "aws_eip" "argo_server_eip" {
   instance = aws_instance.argo_server.id
-  vpc      = true
 }
 
 resource "aws_eip" "k8s_master_eip" {
   instance = aws_instance.k8s_master.id
-  vpc      = true
 }
 
 resource "aws_eip" "k8s_worker_eip" {
   instance = aws_instance.k8s_worker.id
-  vpc      = true
 }
 
 resource "aws_eip" "monitor_eip" {
   instance = aws_instance.monitor.id
-  vpc      = true
 }
