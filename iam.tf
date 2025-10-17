@@ -1,13 +1,3 @@
-data "aws_iam_policy_document" "ec2_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "master_role" {
   name               = "ec2-master-upload-kubeconfig-role"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
@@ -61,16 +51,6 @@ resource "aws_iam_role_policy_attachment" "argo_attach" {
 resource "aws_iam_instance_profile" "argo_profile" {
   name = "ec2-argo-read-kubeconfig-profile"
   role = aws_iam_role.argo_role.name
-}
-
-data "aws_iam_policy_document" "ec2_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
 }
 
 resource "aws_iam_role" "s3_read_role" {
