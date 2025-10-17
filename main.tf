@@ -65,6 +65,43 @@ resource "aws_security_group" "default" {
   }
 }
 
+# IAM role + policy + instance profile
+resource "aws_iam_role" "s3_read_role" {
+  name               = "ec2-s3-read-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+
+resource "aws_iam_policy" "s3_read_policy" {
+  name = "ec2-s3-read-policy"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          "arn:aws:s3:::${var.kubeconfig_s3_bucket}",
+          "arn:aws:s3:::${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/*",
+          "arn:aws:s3:::${var.kubeconfig_s3_bucket}/bootstrap/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_read" {
+  role       = aws_iam_role.s3_read_role.name
+  policy_arn = aws_iam_policy.s3_read_policy.arn
+}
+
+resource "aws_iam_instance_profile" "s3_read_profile" {
+  name = "ec2-s3-read-profile"
+  role = aws_iam_role.s3_read_role.name
+}
+
 # arogoCD
 resource "aws_instance" "argo_server" {
   ami                   = data.aws_ami.ubuntu.id
@@ -170,52 +207,16 @@ resource "aws_instance" "k8s_master" {
   key_name              = var.aws_key_name
   subnet_id             = var.subnet_id
   vpc_security_group_ids = [aws_security_group.default.id]
-  iam_instance_profile  = aws_iam_instance_profile.master_profile.name
+  iam_instance_profile = aws_iam_instance_profile.s3_read_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
     set -eux
-    export DEBIAN_FRONTEND=noninteractive
-
-    retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
-
     apt-get update -y
-    retry apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli || true
-    systemctl enable --now docker || true
-
-    # robust K8s apt install like master
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-    if [ -s /tmp/k8s-key.gpg ]; then
-      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-      apt-get update -y || true
-      retry apt-get install -y kubelet kubeadm kubectl || true
-      apt-mark hold kubelet kubeadm kubectl || true
-    else
-      echo "Failed to fetch K8s apt key; attempting kubectl only fallback" >&2
-      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-      if [ -n "$${KUBEV}" ]; then
-        curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
-        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
-      fi
-    fi
-
-    # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
-    JOIN_FILE="/root/join_cmd.sh"
-    for i in $(seq 1 30); do
-      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE} --no-progress; then
-        chmod +x $${JOIN_FILE}
-        bash $${JOIN_FILE} && break
-      fi
-      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
-      sleep 10
-    done
-
-    # If join failed, write log for debugging
-    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
-      echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
-      journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
-    fi
+    apt-get install -y awscli curl || true
+    aws s3 cp s3://${var.kubeconfig_s3_bucket}/bootstrap/master.sh /tmp/master.sh --region ${var.aws_region}
+    chmod +x /tmp/master.sh
+    /bin/bash /tmp/master.sh
   EOF
 
   tags = {
@@ -229,52 +230,22 @@ resource "aws_instance" "k8s_worker" {
   key_name              = var.aws_key_name
   subnet_id             = var.subnet_id
   vpc_security_group_ids = [aws_security_group.default.id]
-  iam_instance_profile  = aws_iam_instance_profile.argo_profile.name
+  iam_instance_profile  = aws_iam_instance_profile.s3_read_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
-    retry() { n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
+    retry(){ n=0; until [ $n -ge 5 ]; do "$@" && break; n=$((n+1)); sleep 5; done }
 
     apt-get update -y
-    retry apt-get install -y docker.io curl apt-transport-https ca-certificates gnupg jq awscli || true
-    systemctl enable --now docker || true
+    retry apt-get install -y awscli curl || true
 
-    # robust K8s apt install like master
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /tmp/k8s-key.gpg || true
-    if [ -s /tmp/k8s-key.gpg ]; then
-      install -o root -g root -m 644 /tmp/k8s-key.gpg /usr/share/keyrings/kubernetes-archive-keyring.gpg || true
-      echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-      apt-get update -y || true
-      retry apt-get install -y kubelet kubeadm kubectl || true
-      apt-mark hold kubelet kubeadm kubectl || true
-    else
-      echo "Failed to fetch K8s apt key; attempting kubectl only fallback" >&2
-      KUBEV=$$(curl -fsSL https://dl.k8s.io/release/stable.txt || echo "")
-      if [ -n "$${KUBEV}" ]; then
-        curl -fsSL "https://dl.k8s.io/release/$${KUBEV}/bin/linux/amd64/kubectl" -o /tmp/kubectl || true
-        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl || true
-      fi
-    fi
-
-    # Try to download join command from S3 (master must upload join_cmd.sh to same bucket/prefix)
-    JOIN_FILE="/root/join_cmd.sh"
-    for i in $(seq 1 30); do
-      if aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.kubeconfig_s3_key_prefix}/join_cmd.sh $${JOIN_FILE} --no-progress; then
-        chmod +x $${JOIN_FILE}
-        bash $${JOIN_FILE} && break
-      fi
-      echo "join_cmd.sh not available yet, retrying ($${i}/30)..."
-      sleep 10
-    done
-
-    # If join failed, write log for debugging
-    if ! grep -q "kubeadm join" $${JOIN_FILE} 2>/dev/null; then
-      echo "WARN: join command not applied or missing. Check master uploaded join_cmd.sh to S3 and IAM permissions." > /var/log/k8s-worker-join.log
-      journalctl -u kubelet --no-pager > /var/log/kubelet.log || true
-    fi
+    # fetch and run worker bootstrap from S3
+    retry aws s3 cp s3://${var.kubeconfig_s3_bucket}/${var.bootstrap_key_worker} /tmp/bootstrap-worker.sh --no-progress
+    chmod +x /tmp/bootstrap-worker.sh || true
+    /bin/bash /tmp/bootstrap-worker.sh || true
   EOF
 
   tags = {

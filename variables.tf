@@ -39,3 +39,15 @@ variable "kubeconfig_s3_bucket" {
   type        = string
   default     = "phj-devops-cd"
 }
+
+variable "bootstrap_key_worker" {
+  description = "S3 key for worker bootstrap script"
+  type        = string
+  default     = "bootstrap/worker.sh"
+}
+
+variable "bootstrap_key_master" {
+  description = "S3 key for master bootstrap script"
+  type        = string
+  default     = "bootstrap/master.sh"
+}
